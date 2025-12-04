@@ -7,216 +7,237 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models, transforms
 from skimage.feature import graycomatrix, graycoprops
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 import time
 
 # ================= KONFIGURASI =================
-DATASET_DIR = 'Dataset_Siap_Training' # Folder hasil split & augmentasi
+DATASET_ROOT = 'dataset/train_preprocessing' # Folder hasil script 04 baru
+
 BATCH_SIZE = 16
-LEARNING_RATE = 0.001
-EPOCHS = 20
-NUM_CLASSES = 7
+LEARNING_RATE = 0.0001
+EPOCHS = 30
+NUM_CLASSES = 6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 print(f"🚀 Menggunakan device: {DEVICE}")
 
-# Mapping Label (Sesuai folder Anda)
-CLASSES = ['0_Sehat', '1_Hitam', '2_Pecah', '3_Berjamur', 
-           '4_Berlubang', '5_Coklat', '6_Muda']
-
 # ================= 1. EKSTRAKSI FITUR GLCM =================
-def extract_glcm_features(image):
-    """
-    Mengambil 5 fitur statistik dari GLCM:
-    Contrast, Dissimilarity, Homogeneity, Energy, Correlation
-    """
-    # Convert ke Grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    
+def extract_glcm_features(image_gray):
     # Hitung GLCM (jarak 1, sudut 0, 45, 90, 135)
-    glcm = graycomatrix(gray, distances=[1], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], 
+    glcm = graycomatrix(image_gray, distances=[1], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], 
                         levels=256, symmetric=True, normed=True)
     
-    # Hitung properti (rata-rata dari 4 sudut)
     contrast = graycoprops(glcm, 'contrast').mean()
     dissimilarity = graycoprops(glcm, 'dissimilarity').mean()
     homogeneity = graycoprops(glcm, 'homogeneity').mean()
     energy = graycoprops(glcm, 'energy').mean()
     correlation = graycoprops(glcm, 'correlation').mean()
     
-    # Kembalikan sebagai tensor float
     return torch.tensor([contrast, dissimilarity, homogeneity, energy, correlation], dtype=torch.float32)
 
-# ================= 2. DATASET LOADER CUSTOM =================
-class CoffeeFusionDataset(Dataset):
+# ================= 2. DATASET LOADER (DISESUAIKAN STRUKTUR BARU) =================
+class FusionDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
-        self.root_dir = os.path.join(root_dir, split)
+        # root_dir/train
+        self.split_dir = os.path.join(root_dir, split)
         self.transform = transform
         self.data = []
         
-        # Load semua path gambar
-        for label_idx, class_name in enumerate(CLASSES):
-            class_dir = os.path.join(self.root_dir, class_name)
-            if not os.path.exists(class_dir):
+        # Cek folder split
+        if not os.path.exists(self.split_dir):
+            print(f"❌ Error: Folder '{self.split_dir}' tidak ditemukan!")
+            return
+
+        # Ambil daftar kelas (0_Sehat, 1_Hitam, dst)
+        self.classes = sorted([d for d in os.listdir(self.split_dir) if os.path.isdir(os.path.join(self.split_dir, d))])
+        
+        print(f"📂 Memuat data '{split}'...")
+        
+        for label_idx, class_name in enumerate(self.classes):
+            # Masuk ke folder kelas: Dataset_Siap_Model/train/0_Sehat
+            class_path = os.path.join(self.split_dir, class_name)
+            
+            # Tentukan sub-folder RGB dan GLCM
+            rgb_folder = os.path.join(class_path, 'ShuffleNet_RGB')
+            gray_folder = os.path.join(class_path, 'GLCM_Grayscale')
+            
+            if not os.path.exists(rgb_folder) or not os.path.exists(gray_folder):
+                print(f"   ⚠️ Skip kelas '{class_name}': Sub-folder tidak lengkap.")
                 continue
-            for img_name in os.listdir(class_dir):
-                if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    self.data.append((os.path.join(class_dir, img_name), label_idx))
+            
+            # Ambil file dari folder RGB
+            files = os.listdir(rgb_folder)
+            count = 0
+            for f in files:
+                # Pastikan file gambar valid
+                if not f.lower().endswith(('.png', '.jpg', '.jpeg')): continue
+
+                path_img_rgb = os.path.join(rgb_folder, f)
+                path_img_gray = os.path.join(gray_folder, f)
+                
+                # Validasi: File pasangannya di folder Gray harus ada
+                if os.path.exists(path_img_gray):
+                    self.data.append((path_img_rgb, path_img_gray, label_idx))
+                    count += 1
+            
+            print(f"   - Kelas {class_name}: {count} gambar")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        img_path, label = self.data[idx]
+        path_rgb, path_gray, label = self.data[idx]
         
-        # Baca gambar (OpenCV baca sebagai BGR, convert ke RGB)
-        img = cv2.imread(img_path)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Baca Gambar
+        img_rgb = cv2.imread(path_rgb)
+        img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2RGB)
+        img_gray = cv2.imread(path_gray, cv2.IMREAD_GRAYSCALE)
         
-        # --- JALUR 1: GLCM (Manual Feature) ---
-        # GLCM dihitung dari gambar asli (sebelum resize tensor) agar tekstur terjaga
-        # Kita resize sedikit ke 224 agar beban komputasi GLCM tidak terlalu berat
-        img_resized_cv = cv2.resize(img, (224, 224)) 
-        glcm_features = extract_glcm_features(img_resized_cv)
-        
-        # --- JALUR 2: ShuffleNet (Visual Feature) ---
+        # Jalur 1: ShuffleNet
         if self.transform:
-            img_tensor = self.transform(img) # Output sudah tensor
+            visual_input = self.transform(img_rgb)
+            
+        # Jalur 2: GLCM
+        texture_input = extract_glcm_features(img_gray)
         
-        return img_tensor, glcm_features, label
+        return visual_input, texture_input, label
 
-# Transformasi standar untuk Input CNN (ShuffleNet)
-data_transforms = {
-    'train': transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-    'test': transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ]),
-}
+# Transformasi Standar
+data_transforms = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
 
 # ================= 3. ARSITEKTUR MODEL FUSI =================
-class FusionShuffleNetGLCM(nn.Module):
+class FusionModel(nn.Module):
     def __init__(self, num_classes):
-        super(FusionShuffleNetGLCM, self).__init__()
+        super(FusionModel, self).__init__()
         
-        # --- Cabang 1: ShuffleNetV2 (Pre-trained) ---
-        self.cnn = models.shufflenet_v2_x1_0(weights=models.ShuffleNet_V2_X1_0_Weights.DEFAULT)
-        
-        # Kita hapus layer klasifikasi bawaan (fc)
-        # Output fitur ShuffleNet x1.0 adalah 1024 channel
+        # Visual Branch (ShuffleNet)
+        self.cnn = models.shufflenet_v2_x1_0(weights='DEFAULT')
         self.cnn.fc = nn.Identity() 
         
-        # --- Cabang 2: GLCM Processing (Optional MLP) ---
-        # Input 5 fitur GLCM -> dinormalisasi lewat Batch Norm
-        self.glcm_fc = nn.Sequential(
-            nn.BatchNorm1d(5), # Penting! Karena skala GLCM beda jauh dengan CNN
-            nn.Linear(5, 16),
+        # Texture Branch (GLCM MLP)
+        self.glcm_mlp = nn.Sequential(
+            nn.BatchNorm1d(5),
+            nn.Linear(5, 32),
             nn.ReLU()
         )
         
-        # --- Fusi & Klasifikasi Akhir ---
-        # Input: 1024 (dari CNN) + 16 (dari GLCM) = 1040
+        # Fusion & Classification
         self.classifier = nn.Sequential(
-            nn.Linear(1024 + 16, 512),
+            nn.Linear(1024 + 32, 512),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(512, num_classes) # Output 7 Kelas
+            nn.Linear(512, num_classes)
         )
 
-    def forward(self, image, glcm_data):
-        # Proses Jalur Visual
-        visual_feat = self.cnn(image) # Shape: [Batch, 1024]
-        
-        # Proses Jalur Tekstur
-        texture_feat = self.glcm_fc(glcm_data) # Shape: [Batch, 16]
-        
-        # Gabungkan (Concatenate)
-        combined_feat = torch.cat((visual_feat, texture_feat), dim=1)
-        
-        # Klasifikasi
-        output = self.classifier(combined_feat)
-        return output
+    def forward(self, x_visual, x_texture):
+        feat_visual = self.cnn(x_visual)
+        feat_texture = self.glcm_mlp(x_texture)
+        feat_fusion = torch.cat((feat_visual, feat_texture), dim=1)
+        return self.classifier(feat_fusion)
 
-# ================= 4. TRAINING & EVALUATION =================
+# ================= 4. TRAINING LOOP =================
 def train_model():
-    # Load Data
-    train_dataset = CoffeeFusionDataset(DATASET_DIR, 'train', data_transforms['train'])
-    test_dataset = CoffeeFusionDataset(DATASET_DIR, 'test', data_transforms['test'])
+    # Cek dataset
+    if not os.path.exists(DATASET_ROOT):
+        print(f"❌ Error: Folder '{DATASET_ROOT}' tidak ditemukan. Jalankan script 04 dulu!")
+        return
+
+    train_ds = FusionDataset(DATASET_ROOT, 'train', data_transforms)
+    test_ds = FusionDataset(DATASET_ROOT, 'test', data_transforms)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
     
-    print(f"📊 Data Train: {len(train_dataset)} | Data Test: {len(test_dataset)}")
-    
-    # Init Model
-    model = FusionShuffleNetGLCM(num_classes=NUM_CLASSES).to(DEVICE)
+    if len(train_ds) == 0:
+        print("❌ Dataset kosong! Cek kembali proses pre-processing.")
+        return
+
+    model = FusionModel(num_classes=NUM_CLASSES).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
-    # Loop Epoch
+    history = {'train_loss': [], 'train_acc': [], 'test_acc': []}
+    
+    print(f"\n🚀 Mulai Training ({EPOCHS} Epochs)...")
+    start_time = time.time()
+    
     for epoch in range(EPOCHS):
-        print(f"\nEpoch {epoch+1}/{EPOCHS}")
-        print("-" * 10)
-        
-        # --- TRAINING PHASE ---
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
         
-        for images, glcm_feats, labels in train_loader:
-            images, glcm_feats, labels = images.to(DEVICE), glcm_feats.to(DEVICE), labels.to(DEVICE)
+        for visuals, textures, labels in train_loader:
+            visuals, textures, labels = visuals.to(DEVICE), textures.to(DEVICE), labels.to(DEVICE)
             
             optimizer.zero_grad()
-            outputs = model(images, glcm_feats) # Masuk ke model fusi
+            outputs = model(visuals, textures)
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             
             running_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
+            _, preds = torch.max(outputs, 1)
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            correct += (preds == labels).sum().item()
             
+        epoch_loss = running_loss / len(train_loader)
         epoch_acc = 100 * correct / total
-        print(f"Train Loss: {running_loss/len(train_loader):.4f} | Acc: {epoch_acc:.2f}%")
         
-        # --- TESTING PHASE ---
+        # Evaluasi Test
         model.eval()
         correct_test = 0
         total_test = 0
-        all_preds = []
-        all_labels = []
-        
         with torch.no_grad():
-            for images, glcm_feats, labels in test_loader:
-                images, glcm_feats, labels = images.to(DEVICE), glcm_feats.to(DEVICE), labels.to(DEVICE)
-                outputs = model(images, glcm_feats)
-                _, predicted = torch.max(outputs.data, 1)
-                
+            for visuals, textures, labels in test_loader:
+                visuals, textures, labels = visuals.to(DEVICE), textures.to(DEVICE), labels.to(DEVICE)
+                outputs = model(visuals, textures)
+                _, preds = torch.max(outputs, 1)
                 total_test += labels.size(0)
-                correct_test += (predicted == labels).sum().item()
-                
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
+                correct_test += (preds == labels).sum().item()
         test_acc = 100 * correct_test / total_test
-        print(f"Test Acc : {test_acc:.2f}%")
+        
+        history['train_loss'].append(epoch_loss)
+        history['train_acc'].append(epoch_acc)
+        history['test_acc'].append(test_acc)
+        
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.1f}% | Test Acc: {test_acc:.1f}%")
 
-    # --- FINAL EVALUATION ---
-    print("\n✅ Training Selesai. Laporan Evaluasi Akhir:")
-    print(classification_report(all_labels, all_preds, target_names=CLASSES))
+    print(f"\n✅ Selesai dalam {(time.time()-start_time)/60:.1f} menit.")
+    torch.save(model.state_dict(), 'model_fusi_kopi_final.pth')
     
-    # Simpan Model
-    torch.save(model.state_dict(), 'model_skripsi_fusi.pth')
-    print("💾 Model disimpan sebagai 'model_skripsi_fusi.pth'")
+    # Plot Grafik
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_acc'], label='Train')
+    plt.plot(history['test_acc'], label='Test')
+    plt.title('Akurasi')
+    plt.legend()
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_loss'], color='orange')
+    plt.title('Loss')
+    plt.savefig('grafik_training.png')
+    print("📊 Grafik disimpan: grafik_training.png")
+
+    # Classification Report
+    model.eval()
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for visuals, textures, labels in test_loader:
+            visuals, textures = visuals.to(DEVICE), textures.to(DEVICE)
+            outputs = model(visuals, textures)
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+    print("\n--- LAPORAN AKHIR ---")
+    print(classification_report(all_labels, all_preds, target_names=train_ds.classes))
 
 if __name__ == '__main__':
     train_model()
